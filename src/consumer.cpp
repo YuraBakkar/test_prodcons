@@ -12,12 +12,51 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <thread>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
 namespace {
+class ConsumerInstanceLock {
+public:
+    ConsumerInstanceLock() {
+        const std::string path = "/tmp/test_prodcons_consumer_" +
+                                 std::to_string(static_cast<unsigned long long>(getuid())) +
+                                 ".lock";
+        descriptor_ = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (descriptor_ == -1) {
+            std::perror("open consumer lock");
+            return;
+        }
+        if (flock(descriptor_, LOCK_EX | LOCK_NB) == -1) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                another_consumer_ = true;
+            } else {
+                std::perror("flock consumer lock");
+            }
+            close(descriptor_);
+            descriptor_ = -1;
+        }
+    }
+
+    ~ConsumerInstanceLock() {
+        if (descriptor_ != -1) close(descriptor_);
+    }
+
+    ConsumerInstanceLock(const ConsumerInstanceLock&) = delete;
+    ConsumerInstanceLock& operator=(const ConsumerInstanceLock&) = delete;
+
+    bool acquired() const { return descriptor_ != -1; }
+    bool another_consumer() const { return another_consumer_; }
+
+private:
+    int descriptor_ = -1;
+    bool another_consumer_ = false;
+};
+
 struct Statistics {
     std::uint64_t total_packets = 0;
     std::uint64_t interval_packets = 0;
@@ -68,6 +107,14 @@ bool valid_layout(const ipc::SharedHeader& header, std::size_t mapping_size) {
 } // namespace
 
 int main() {
+    ConsumerInstanceLock instance_lock;
+    if (!instance_lock.acquired()) {
+        if (instance_lock.another_consumer()) {
+            std::cerr << "Another Consumer is already running.\n";
+        }
+        return 1;
+    }
+
     control::ProcessControl process_control("Reception");
     std::cout << "Waiting for Producer at " << ipc::shared_memory_name << "...\n";
 

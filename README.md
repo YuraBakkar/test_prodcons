@@ -74,3 +74,8 @@ total=40000 packets/s=39999.8 bytes/s=40959829.9 checksum_errors=0 metadata_erro
 
 Consumer підтримує те саме керування: будь-яка клавіша перемикає pause/resume,
 `SIGUSR1` призупиняє, `SIGUSR2` відновлює, а `Ctrl+C` або `SIGTERM` завершує.
+
+Одночасно для поточного користувача може працювати лише один Consumer. Він
+утримує advisory lock у `/tmp/test_prodcons_consumer_<uid>.lock`; спроба
+запустити другий екземпляр завершується повідомленням
+`Another Consumer is already running.`
