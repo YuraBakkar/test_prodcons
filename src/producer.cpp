@@ -1,10 +1,11 @@
+#include "crc32.hpp"
 #include "ipc_protocol.hpp"
+#include "process_control.hpp"
+#include "semaphore_utils.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -16,76 +17,12 @@
 #include <random>
 #include <string_view>
 #include <system_error>
-#include <termios.h>
 #include <thread>
-#include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
 namespace {
-volatile std::sig_atomic_t stop_requested = 0;
-volatile std::sig_atomic_t requested_state = 0;
-
-void handle_stop_signal(int) { stop_requested = 1; }
-void handle_pause_signal(int) { requested_state = 1; }
-void handle_resume_signal(int) { requested_state = 2; }
-
-class TerminalInput {
-public:
-    TerminalInput() {
-        if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &original_termios_) == -1) {
-            return;
-        }
-
-        termios raw = original_termios_;
-        raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 0;
-        original_flags_ = fcntl(STDIN_FILENO, F_GETFL, 0);
-        if (original_flags_ == -1 || tcsetattr(STDIN_FILENO, TCSANOW, &raw) == -1 ||
-            fcntl(STDIN_FILENO, F_SETFL, original_flags_ | O_NONBLOCK) == -1) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &original_termios_);
-            return;
-        }
-        active_ = true;
-    }
-
-    ~TerminalInput() {
-        if (active_) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &original_termios_);
-            fcntl(STDIN_FILENO, F_SETFL, original_flags_);
-        }
-    }
-
-    TerminalInput(const TerminalInput&) = delete;
-    TerminalInput& operator=(const TerminalInput&) = delete;
-
-    bool key_pressed() const {
-        if (!active_) return false;
-
-        bool received_input = false;
-        char input[64];
-        while (true) {
-            const ssize_t bytes_read = read(STDIN_FILENO, input, sizeof(input));
-            if (bytes_read > 0) {
-                received_input = true;
-                continue;
-            }
-            if (bytes_read == -1 && errno == EINTR) continue;
-            break;
-        }
-        return received_input;
-    }
-
-    bool active() const { return active_; }
-
-private:
-    termios original_termios_{};
-    int original_flags_ = 0;
-    bool active_ = false;
-};
-
 void print_usage(std::string_view program_name) {
     std::cerr << "Usage: " << program_name << " <payload_size_bytes>\n";
 }
@@ -104,18 +41,6 @@ bool parse_payload_size(std::string_view argument, std::size_t& payload_size) {
     }
     payload_size = static_cast<std::size_t>(value);
     return true;
-}
-
-std::uint32_t crc32(const std::byte* data, std::size_t size) {
-    std::uint32_t crc = 0xFFFFFFFFU;
-    for (std::size_t i = 0; i < size; ++i) {
-        crc ^= std::to_integer<std::uint8_t>(data[i]);
-        for (int bit = 0; bit < 8; ++bit) {
-            const std::uint32_t mask = 0U - (crc & 1U);
-            crc = (crc >> 1U) ^ (0xEDB88320U & mask);
-        }
-    }
-    return ~crc;
 }
 
 void fill_random_bytes(std::byte* data, std::size_t size, std::mt19937_64& engine) {
@@ -137,35 +62,6 @@ std::uint64_t current_timestamp_ns() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
 }
 
-enum class WaitResult { acquired, retry, error };
-
-WaitResult wait_for_free_slot(sem_t* semaphore) {
-    timespec deadline{};
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_nsec += 100'000'000;
-    if (deadline.tv_nsec >= 1'000'000'000) {
-        ++deadline.tv_sec;
-        deadline.tv_nsec -= 1'000'000'000;
-    }
-    if (sem_timedwait(semaphore, &deadline) == 0) return WaitResult::acquired;
-    if (errno == EINTR || errno == ETIMEDOUT) return WaitResult::retry;
-    std::perror("sem_timedwait");
-    return WaitResult::error;
-}
-
-void update_transfer_state(bool& paused, const TerminalInput& terminal) {
-    bool new_state = paused;
-    if (requested_state == 1) new_state = true;
-    if (requested_state == 2) new_state = false;
-    requested_state = 0;
-    if (terminal.key_pressed()) new_state = !new_state;
-
-    if (new_state != paused) {
-        paused = new_state;
-        std::cout << (paused ? "Transfer paused.\n" : "Transfer resumed.\n")
-                  << std::flush;
-    }
-}
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -211,10 +107,10 @@ int main(int argc, char* argv[]) {
     }
 
     auto* header = new (mapping) ipc::SharedHeader{};
-    header->magic = ipc::protocol_magic;
     header->version = ipc::protocol_version;
     header->slot_count = slot_count;
     header->slot_size = slot_size;
+    header->payload_size = payload_size;
     if (sem_init(&header->free_slots, 1, static_cast<unsigned int>(slot_count)) == -1 ||
         sem_init(&header->ready_slots, 1, 0) == -1) {
         std::perror("sem_init");
@@ -222,34 +118,30 @@ int main(int argc, char* argv[]) {
         shm_unlink(ipc::shared_memory_name);
         return 1;
     }
+    header->magic = ipc::protocol_magic;
 
-    std::signal(SIGINT, handle_stop_signal);
-    std::signal(SIGTERM, handle_stop_signal);
-    std::signal(SIGUSR1, handle_pause_signal);
-    std::signal(SIGUSR2, handle_resume_signal);
-    TerminalInput terminal;
+    control::ProcessControl process_control("Transfer");
     std::random_device random_device;
     std::mt19937_64 random_engine(random_device());
     std::cout << "Producing " << payload_size << "-byte packets in "
               << ipc::shared_memory_name << " (" << slot_count
               << " slots).\n"
               << "SIGUSR1 pauses, SIGUSR2 resumes, Ctrl+C stops.";
-    if (terminal.active()) std::cout << " Any key toggles pause/resume.";
+    if (process_control.keyboard_active()) std::cout << " Any key toggles pause/resume.";
     std::cout << '\n';
 
     std::uint64_t sequence_number = 0;
-    bool paused = false;
     bool failed = false;
-    while (!stop_requested) {
-        update_transfer_state(paused, terminal);
-        if (paused) {
+    while (!process_control.stop_requested()) {
+        process_control.update();
+        if (process_control.paused()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
 
-        const WaitResult wait_result = wait_for_free_slot(&header->free_slots);
-        if (wait_result == WaitResult::retry) continue;
-        if (wait_result == WaitResult::error) {
+        const ipc::SemaphoreWaitResult wait_result = ipc::timed_wait(&header->free_slots);
+        if (wait_result == ipc::SemaphoreWaitResult::retry) continue;
+        if (wait_result == ipc::SemaphoreWaitResult::error) {
             failed = true;
             break;
         }
@@ -262,7 +154,7 @@ int main(int argc, char* argv[]) {
         metadata->timestamp_ns = current_timestamp_ns();
         metadata->sequence_number = sequence_number++;
         metadata->payload_size = static_cast<std::uint32_t>(payload_size);
-        metadata->checksum = crc32(payload, payload_size);
+        metadata->checksum = checksum::crc32(payload, payload_size);
 
         ++header->producer_index;
         sem_post(&header->ready_slots);

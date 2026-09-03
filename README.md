@@ -1,4 +1,4 @@
-# Producer
+# Producer / Consumer
 
 Консольний застосунок на C++17, який безперервно створює пакети із випадковим
 payload заданого розміру. Кожен пакет містить Unix timestamp у наносекундах,
@@ -45,3 +45,28 @@ Producer працює до натискання `Ctrl+C`. Керування п�
 Producing 1024-byte packets in /test_prodcons_packets (256 slots).
 SIGUSR1 pauses, SIGUSR2 resumes, Ctrl+C stops. Any key toggles pause/resume.
 ```
+
+## Consumer
+
+Consumer потрібно запустити після Producer в іншому терміналі:
+
+```bash
+./build/consumer
+```
+
+Він читає пакети зі shared memory та перевіряє timestamp, розмір payload,
+послідовність номерів і CRC-32. Приблизно раз на секунду виводиться:
+
+- загальна кількість отриманих пакетів (`total`);
+- кількість пакетів за секунду (`packets/s`);
+- кількість байтів payload за секунду (`bytes/s`);
+- кількість помилок checksum, метаданих і послідовності.
+
+Приклад:
+
+```text
+total=40000 packets/s=39999.8 bytes/s=40959829.9 checksum_errors=0 metadata_errors=0 sequence_errors=0
+```
+
+Consumer підтримує те саме керування: будь-яка клавіша перемикає pause/resume,
+`SIGUSR1` призупиняє, `SIGUSR2` відновлює, а `Ctrl+C` або `SIGTERM` завершує.

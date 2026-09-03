@@ -24,6 +24,7 @@ struct alignas(64) SharedHeader {
     std::uint32_t version;
     std::uint64_t slot_count;
     std::uint64_t slot_size;
+    std::uint64_t payload_size;
     alignas(64) std::uint64_t producer_index;
     alignas(64) std::uint64_t consumer_index;
     sem_t free_slots;
