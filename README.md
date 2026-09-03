@@ -29,11 +29,19 @@ cmake --build build
 ./build/producer 1024
 ```
 
-Producer працює до натискання `Ctrl+C`. Без запущеного Consumer він заповнить
-кільцевий буфер і чекатиме звільнення слотів.
+Producer працює до натискання `Ctrl+C`. Керування передачею:
+
+- будь-яка клавіша в терміналі — перемкнути pause/resume;
+- `kill -USR1 <pid>` — призупинити;
+- `kill -USR2 <pid>` — відновити;
+- `kill -TERM <pid>` або `Ctrl+C` — завершити.
+
+Без запущеного Consumer Producer заповнить кільцевий буфер і чекатиме
+звільнення слотів.
 
 Приклад початкового повідомлення:
 
 ```text
-Producing 1024-byte packets in /test_prodcons_packets (256 slots). Press Ctrl+C to stop.
+Producing 1024-byte packets in /test_prodcons_packets (256 slots).
+SIGUSR1 pauses, SIGUSR2 resumes, Ctrl+C stops. Any key toggles pause/resume.
 ```
