@@ -1,9 +1,11 @@
 #include "crc32.hpp"
 #include "ipc_protocol.hpp"
 #include "process_control.hpp"
+#include "process_lock.hpp"
 #include "semaphore_utils.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -75,6 +77,21 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: payload size must be between 1 and "
                   << ipc::maximum_payload_size << " bytes.\n";
         print_usage(argv[0]);
+        return 1;
+    }
+
+    control::ProcessInstanceLock instance_lock("producer");
+    if (!instance_lock.acquired()) {
+        if (instance_lock.another_instance()) {
+            std::cerr << "Another Producer is already running.\n";
+        }
+        return 1;
+    }
+
+    if (shm_unlink(ipc::shared_memory_name) == 0) {
+        std::cout << "Removed stale shared memory from a previous Producer.\n";
+    } else if (errno != ENOENT) {
+        std::perror("shm_unlink");
         return 1;
     }
 

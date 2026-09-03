@@ -1,6 +1,7 @@
 #include "crc32.hpp"
 #include "ipc_protocol.hpp"
 #include "process_control.hpp"
+#include "process_lock.hpp"
 #include "semaphore_utils.hpp"
 
 #include <cerrno>
@@ -12,51 +13,12 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <string>
 #include <thread>
 #include <unistd.h>
-#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
 namespace {
-class ConsumerInstanceLock {
-public:
-    ConsumerInstanceLock() {
-        const std::string path = "/tmp/test_prodcons_consumer_" +
-                                 std::to_string(static_cast<unsigned long long>(getuid())) +
-                                 ".lock";
-        descriptor_ = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (descriptor_ == -1) {
-            std::perror("open consumer lock");
-            return;
-        }
-        if (flock(descriptor_, LOCK_EX | LOCK_NB) == -1) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                another_consumer_ = true;
-            } else {
-                std::perror("flock consumer lock");
-            }
-            close(descriptor_);
-            descriptor_ = -1;
-        }
-    }
-
-    ~ConsumerInstanceLock() {
-        if (descriptor_ != -1) close(descriptor_);
-    }
-
-    ConsumerInstanceLock(const ConsumerInstanceLock&) = delete;
-    ConsumerInstanceLock& operator=(const ConsumerInstanceLock&) = delete;
-
-    bool acquired() const { return descriptor_ != -1; }
-    bool another_consumer() const { return another_consumer_; }
-
-private:
-    int descriptor_ = -1;
-    bool another_consumer_ = false;
-};
-
 struct Statistics {
     std::uint64_t total_packets = 0;
     std::uint64_t interval_packets = 0;
@@ -104,146 +66,186 @@ bool valid_layout(const ipc::SharedHeader& header, std::size_t mapping_size) {
     }
     return sizeof(ipc::SharedHeader) + header.slot_count * header.slot_size <= mapping_size;
 }
+
+struct SharedMemoryIdentity {
+    dev_t device = 0;
+    ino_t inode = 0;
+};
+
+bool shared_memory_was_replaced(const SharedMemoryIdentity& identity) {
+    const int fd = shm_open(ipc::shared_memory_name, O_RDONLY, 0);
+    if (fd == -1) return errno == ENOENT;
+
+    struct stat status {};
+    const bool replaced = fstat(fd, &status) == -1 ||
+                          status.st_dev != identity.device ||
+                          status.st_ino != identity.inode;
+    close(fd);
+    return replaced;
+}
 } // namespace
 
 int main() {
-    ConsumerInstanceLock instance_lock;
+    control::ProcessInstanceLock instance_lock("consumer");
     if (!instance_lock.acquired()) {
-        if (instance_lock.another_consumer()) {
+        if (instance_lock.another_instance()) {
             std::cerr << "Another Consumer is already running.\n";
         }
         return 1;
     }
 
     control::ProcessControl process_control("Reception");
-    std::cout << "Waiting for Producer at " << ipc::shared_memory_name << "...\n";
-
-    void* mapping = MAP_FAILED;
-    std::size_t mapping_size = 0;
-    ipc::SharedHeader* header = nullptr;
-    while (!process_control.stop_requested() && header == nullptr) {
-        process_control.update();
-        if (process_control.paused()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        const int fd = shm_open(ipc::shared_memory_name, O_RDWR, 0);
-        if (fd == -1) {
-            if (errno != ENOENT) {
-                std::perror("shm_open");
-                return 1;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        struct stat status {};
-        if (fstat(fd, &status) == -1) {
-            std::perror("fstat");
-            close(fd);
-            return 1;
-        }
-        if (status.st_size < static_cast<off_t>(sizeof(ipc::SharedHeader))) {
-            close(fd);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        mapping_size = static_cast<std::size_t>(status.st_size);
-        mapping = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        close(fd);
-        if (mapping == MAP_FAILED) {
-            std::perror("mmap");
-            return 1;
-        }
-
-        auto* candidate = static_cast<ipc::SharedHeader*>(mapping);
-        if (candidate->magic == 0) {
-            munmap(mapping, mapping_size);
-            mapping = MAP_FAILED;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        if (!valid_layout(*candidate, mapping_size)) {
-            std::cerr << "Shared memory contains an incompatible or invalid protocol header.\n";
-            munmap(mapping, mapping_size);
-            return 1;
-        }
-        header = candidate;
-    }
-
-    if (process_control.stop_requested()) {
-        std::cout << "Stopped while waiting for Producer.\n";
-        return 0;
-    }
-
-    std::cout << "Receiving packets from " << ipc::shared_memory_name << ".\n"
-              << "SIGUSR1 pauses, SIGUSR2 resumes, Ctrl+C stops.";
-    if (process_control.keyboard_active()) std::cout << " Any key toggles pause/resume.";
-    std::cout << '\n';
-
     Statistics statistics;
-    auto last_report = std::chrono::steady_clock::now();
     bool failed = false;
+    bool controls_announced = false;
     while (!process_control.stop_requested()) {
-        const bool was_paused = process_control.paused();
-        process_control.update();
-        if (process_control.paused()) {
-            if (!was_paused) {
+        std::cout << "Waiting for Producer at " << ipc::shared_memory_name << "...\n";
+
+        void* mapping = MAP_FAILED;
+        std::size_t mapping_size = 0;
+        ipc::SharedHeader* header = nullptr;
+        SharedMemoryIdentity identity;
+        while (!process_control.stop_requested() && header == nullptr) {
+            process_control.update();
+            if (process_control.paused()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+
+            const int fd = shm_open(ipc::shared_memory_name, O_RDWR, 0);
+            if (fd == -1) {
+                if (errno != ENOENT) {
+                    std::perror("shm_open");
+                    failed = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+
+            struct stat status {};
+            if (fstat(fd, &status) == -1) {
+                std::perror("fstat");
+                close(fd);
+                failed = true;
+                break;
+            }
+            if (status.st_size < static_cast<off_t>(sizeof(ipc::SharedHeader))) {
+                close(fd);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+
+            mapping_size = static_cast<std::size_t>(status.st_size);
+            mapping = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
+            if (mapping == MAP_FAILED) {
+                std::perror("mmap");
+                failed = true;
+                break;
+            }
+
+            auto* candidate = static_cast<ipc::SharedHeader*>(mapping);
+            if (candidate->magic == 0) {
+                munmap(mapping, mapping_size);
+                mapping = MAP_FAILED;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            if (!valid_layout(*candidate, mapping_size)) {
+                std::cerr << "Shared memory contains an incompatible or invalid protocol header.\n";
+                munmap(mapping, mapping_size);
+                failed = true;
+                break;
+            }
+            header = candidate;
+            identity = {status.st_dev, status.st_ino};
+        }
+
+        if (failed || process_control.stop_requested()) break;
+
+        std::cout << "Receiving packets from " << ipc::shared_memory_name << ".\n";
+        if (!controls_announced) {
+            std::cout << "SIGUSR1 pauses, SIGUSR2 resumes, Ctrl+C stops.";
+            if (process_control.keyboard_active()) {
+                std::cout << " Any key toggles pause/resume.";
+            }
+            std::cout << '\n';
+            controls_announced = true;
+        }
+
+        statistics.interval_packets = 0;
+        statistics.interval_bytes = 0;
+        statistics.has_sequence = false;
+        auto last_report = std::chrono::steady_clock::now();
+        bool reconnect = false;
+        while (!process_control.stop_requested()) {
+            const bool was_paused = process_control.paused();
+            process_control.update();
+            if (process_control.paused()) {
+                if (!was_paused) {
+                    statistics.interval_packets = 0;
+                    statistics.interval_bytes = 0;
+                }
+                last_report = std::chrono::steady_clock::now();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            if (was_paused) {
                 statistics.interval_packets = 0;
                 statistics.interval_bytes = 0;
+                last_report = std::chrono::steady_clock::now();
             }
-            last_report = std::chrono::steady_clock::now();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-        if (was_paused) {
-            statistics.interval_packets = 0;
-            statistics.interval_bytes = 0;
-            last_report = std::chrono::steady_clock::now();
-        }
-        report_if_due(statistics, last_report);
+            report_if_due(statistics, last_report);
 
-        const ipc::SemaphoreWaitResult wait_result = ipc::timed_wait(&header->ready_slots);
-        if (wait_result == ipc::SemaphoreWaitResult::retry) continue;
-        if (wait_result == ipc::SemaphoreWaitResult::error) {
-            failed = true;
-            break;
-        }
-
-        std::byte* slot = ipc::slot_at(header, header->consumer_index);
-        const auto* metadata = reinterpret_cast<const ipc::PacketMetadata*>(slot);
-        const std::size_t payload_capacity = header->slot_size - sizeof(*metadata);
-        bool metadata_valid = metadata->timestamp_ns != 0 &&
-                              metadata->payload_size == header->payload_size &&
-                              metadata->payload_size <= payload_capacity;
-
-        ++statistics.total_packets;
-        ++statistics.interval_packets;
-        if (!metadata_valid) {
-            ++statistics.metadata_errors;
-        } else {
-            statistics.interval_bytes += metadata->payload_size;
-            const std::byte* payload = slot + sizeof(*metadata);
-            if (checksum::crc32(payload, metadata->payload_size) != metadata->checksum) {
-                ++statistics.checksum_errors;
+            const ipc::SemaphoreWaitResult wait_result = ipc::timed_wait(&header->ready_slots);
+            if (wait_result == ipc::SemaphoreWaitResult::retry) {
+                if (shared_memory_was_replaced(identity)) {
+                    std::cout << "Producer disconnected; reconnecting.\n";
+                    reconnect = true;
+                    break;
+                }
+                continue;
+            }
+            if (wait_result == ipc::SemaphoreWaitResult::error) {
+                failed = true;
+                break;
             }
 
-            if (statistics.has_sequence &&
-                metadata->sequence_number != statistics.expected_sequence) {
-                ++statistics.sequence_errors;
+            std::byte* slot = ipc::slot_at(header, header->consumer_index);
+            const auto* metadata = reinterpret_cast<const ipc::PacketMetadata*>(slot);
+            const std::size_t payload_capacity = header->slot_size - sizeof(*metadata);
+            const bool metadata_valid = metadata->timestamp_ns != 0 &&
+                                        metadata->payload_size == header->payload_size &&
+                                        metadata->payload_size <= payload_capacity;
+
+            ++statistics.total_packets;
+            ++statistics.interval_packets;
+            if (!metadata_valid) {
+                ++statistics.metadata_errors;
+            } else {
+                statistics.interval_bytes += metadata->payload_size;
+                const std::byte* payload = slot + sizeof(*metadata);
+                if (checksum::crc32(payload, metadata->payload_size) != metadata->checksum) {
+                    ++statistics.checksum_errors;
+                }
+
+                if (statistics.has_sequence &&
+                    metadata->sequence_number != statistics.expected_sequence) {
+                    ++statistics.sequence_errors;
+                }
+                statistics.expected_sequence = metadata->sequence_number + 1;
+                statistics.has_sequence = true;
             }
-            statistics.expected_sequence = metadata->sequence_number + 1;
-            statistics.has_sequence = true;
+
+            ++header->consumer_index;
+            sem_post(&header->free_slots);
         }
 
-        ++header->consumer_index;
-        sem_post(&header->free_slots);
+        munmap(mapping, mapping_size);
+        if (failed || !reconnect) break;
     }
 
-    report_if_due(statistics, last_report);
     std::cout << "Stopped after receiving " << statistics.total_packets << " packets.\n";
-    munmap(mapping, mapping_size);
     return failed ? 1 : 0;
 }
