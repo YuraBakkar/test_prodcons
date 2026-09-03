@@ -48,11 +48,15 @@ SIGUSR1 pauses, SIGUSR2 resumes, Ctrl+C stops. Any key toggles pause/resume.
 
 ## Consumer
 
-Consumer потрібно запустити після Producer в іншому терміналі:
+Consumer можна запускати до або після Producer в іншому терміналі:
 
 ```bash
 ./build/consumer
 ```
+
+Якщо Producer ще не запущений, Consumer чекатиме на появу shared memory без
+активного опитування. Під час очікування працюють сигнали завершення та
+pause/resume.
 
 Він читає пакети зі shared memory та перевіряє timestamp, розмір payload,
 послідовність номерів і CRC-32. Приблизно раз на секунду виводиться:

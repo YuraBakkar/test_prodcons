@@ -3,6 +3,7 @@
 #include "process_control.hpp"
 #include "semaphore_utils.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -67,35 +68,68 @@ bool valid_layout(const ipc::SharedHeader& header, std::size_t mapping_size) {
 } // namespace
 
 int main() {
-    const int fd = shm_open(ipc::shared_memory_name, O_RDWR, 0);
-    if (fd == -1) {
-        std::perror("shm_open");
-        std::cerr << "Start Producer before Consumer.\n";
-        return 1;
-    }
-
-    struct stat status {};
-    if (fstat(fd, &status) == -1 || status.st_size < static_cast<off_t>(sizeof(ipc::SharedHeader))) {
-        std::cerr << "Shared memory has an invalid size.\n";
-        close(fd);
-        return 1;
-    }
-    const std::size_t mapping_size = static_cast<std::size_t>(status.st_size);
-    void* mapping = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (mapping == MAP_FAILED) {
-        std::perror("mmap");
-        return 1;
-    }
-
-    auto* header = static_cast<ipc::SharedHeader*>(mapping);
-    if (!valid_layout(*header, mapping_size)) {
-        std::cerr << "Shared memory contains an incompatible or invalid protocol header.\n";
-        munmap(mapping, mapping_size);
-        return 1;
-    }
-
     control::ProcessControl process_control("Reception");
+    std::cout << "Waiting for Producer at " << ipc::shared_memory_name << "...\n";
+
+    void* mapping = MAP_FAILED;
+    std::size_t mapping_size = 0;
+    ipc::SharedHeader* header = nullptr;
+    while (!process_control.stop_requested() && header == nullptr) {
+        process_control.update();
+        if (process_control.paused()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        const int fd = shm_open(ipc::shared_memory_name, O_RDWR, 0);
+        if (fd == -1) {
+            if (errno != ENOENT) {
+                std::perror("shm_open");
+                return 1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        struct stat status {};
+        if (fstat(fd, &status) == -1) {
+            std::perror("fstat");
+            close(fd);
+            return 1;
+        }
+        if (status.st_size < static_cast<off_t>(sizeof(ipc::SharedHeader))) {
+            close(fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        mapping_size = static_cast<std::size_t>(status.st_size);
+        mapping = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (mapping == MAP_FAILED) {
+            std::perror("mmap");
+            return 1;
+        }
+
+        auto* candidate = static_cast<ipc::SharedHeader*>(mapping);
+        if (candidate->magic == 0) {
+            munmap(mapping, mapping_size);
+            mapping = MAP_FAILED;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        if (!valid_layout(*candidate, mapping_size)) {
+            std::cerr << "Shared memory contains an incompatible or invalid protocol header.\n";
+            munmap(mapping, mapping_size);
+            return 1;
+        }
+        header = candidate;
+    }
+
+    if (process_control.stop_requested()) {
+        std::cout << "Stopped while waiting for Producer.\n";
+        return 0;
+    }
 
     std::cout << "Receiving packets from " << ipc::shared_memory_name << ".\n"
               << "SIGUSR1 pauses, SIGUSR2 resumes, Ctrl+C stops.";
